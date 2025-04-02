@@ -1,0 +1,99 @@
+import json
+import boto3
+import os
+
+# Initialize the Comprehend client outside the handler for efficiency
+comprehend_client = boto3.client('comprehend')
+
+# Define the name of the environment variable for language code
+LANGUAGE_CODE_ENV_VAR = "LANGUAGE_CODE"
+
+print("Lambda function initializing...") # Log message when the function container starts
+
+def lambda_handler(event, context):
+    """
+    Handles incoming API Gateway requests, extracts text, analyzes sentiment
+    using Comprehend, and returns the sentiment in the response.
+    """
+    print("Received event:", json.dumps(event)) # Log the raw event for debugging
+
+    try:
+        # API Gateway typically sends the request body as a JSON string
+        # For HTTP APIs (often simpler), it might be directly in event['body']
+        # For REST APIs (proxy integration), also often in event['body']
+        if 'body' not in event or not event['body']:
+            print("Error: Missing or empty 'body' in the event.")
+            return {
+                'statusCode': 400, # Bad Request
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': "Request body is missing or empty."})
+            }
+
+        # Parse the JSON string body into a Python dictionary
+        try:
+            request_body = json.loads(event['body'])
+        except json.JSONDecodeError:
+            print("Error: Could not decode JSON from request body.")
+            return {
+                'statusCode': 400, # Bad Request
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': "Invalid JSON format in request body."})
+            }
+
+        # Extract the text to be analyzed from the parsed body
+        if 'text' not in request_body or not request_body['text']:
+            print("Error: Missing or empty 'text' field in JSON body.")
+            return {
+                'statusCode': 400, # Bad Request
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': "Missing 'text' field in request body."})
+            }
+
+        text_to_analyze = request_body['text']
+        print(f"Extracted text to analyze: '{text_to_analyze}'")
+
+        # Get language code from environment variable, default to 'en'
+        language_code = os.environ.get(LANGUAGE_CODE_ENV_VAR, 'en')
+        print(f"Using language code: {language_code}")
+
+        # Call Comprehend's DetectSentiment API
+        print("Calling Comprehend DetectSentiment...")
+        response = comprehend_client.detect_sentiment(
+            Text=text_to_analyze,
+            LanguageCode=language_code # Specify language ('en' for English)
+        )
+        print("Comprehend response received.")
+
+        # Extract the primary sentiment
+        sentiment = response.get('Sentiment', 'UNKNOWN') # Use .get for safety
+        sentiment_score = response.get('SentimentScore', {}) # Get the scores too
+
+        print(f"Detected sentiment: {sentiment}")
+        print(f"Sentiment scores: {sentiment_score}")
+
+        # Prepare the successful response body
+        response_body = {
+            'sentiment': sentiment,
+            'scores': sentiment_score # Include scores in response
+        }
+
+        # Return the response in the format API Gateway expects
+        return {
+            'statusCode': 200, # OK
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*' # Basic CORS header (consider restricting in production)
+                },
+            'body': json.dumps(response_body)
+        }
+
+    except Exception as e:
+        # Catch any other unexpected errors during processing
+        print(f"Error during processing: {str(e)}")
+        # Consider logging the full stack trace in production: import traceback; traceback.print_exc()
+
+        return {
+            'statusCode': 500, # Internal Server Error
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({'error': f"An internal error occurred: {str(e)}"})
+        }
