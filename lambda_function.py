@@ -8,7 +8,6 @@ import urllib.parse # Added for handling object keys with spaces/special chars
 TABLE_NAME = os.environ.get('DYNAMODB_TABLE', 'ImageAnalysisResults') # Default if not set
 
 # Initialize AWS clients
-# It's good practice to initialize them outside the handler for potential reuse
 s3_client = boto3.client('s3')
 rekognition_client = boto3.client('rekognition')
 dynamodb = boto3.resource('dynamodb') # Using resource for simpler PutItem
