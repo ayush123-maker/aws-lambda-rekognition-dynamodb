@@ -1,0 +1,414 @@
+## Main File
+# Configure the AWS Provider
+provider "aws" {
+  region = "us-east-1" # Or your preferred region
+}
+
+# Tell Terraform which version of the AWS provider we want
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.1"
+    }
+     archive = {
+       source = "hashicorp/archive"
+     }
+  }
+}
+
+# Resource to generate a random suffix
+resource "random_string" "bucket_suffix" {
+  length  = 8
+  special = false
+  upper   = false
+}
+
+# Website S3 Bucket
+resource "aws_s3_bucket" "website_bucket" {
+  bucket = "polly-tts-website-${random_string.bucket_suffix.id}"
+  tags = { Project = "Polly-TTS-Website", Purpose = "Static Website Hosting" }
+}
+
+# Audio S3 Bucket
+resource "aws_s3_bucket" "audio_bucket" {
+  bucket = "polly-tts-audio-${random_string.bucket_suffix.id}"
+  tags = { Project = "Polly-TTS-Website", Purpose = "Generated Audio Files" }
+}
+
+# Website Bucket Configuration
+resource "aws_s3_bucket_website_configuration" "website_config" {
+  bucket = aws_s3_bucket.website_bucket.id
+  index_document { suffix = "index.html" }
+  error_document { key = "error.html" }
+}
+
+# Website Bucket Public Access Block
+resource "aws_s3_bucket_public_access_block" "website_public_access" {
+  bucket = aws_s3_bucket.website_bucket.id
+  block_public_acls       = true
+  block_public_policy     = false
+  ignore_public_acls      = true
+  restrict_public_buckets = false
+}
+
+# Website Bucket Policy
+resource "aws_s3_bucket_policy" "website_policy" {
+  bucket = aws_s3_bucket.website_bucket.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+        Sid       = "PublicReadGetObject"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.website_bucket.arn}/*"
+    }]
+  })
+  depends_on = [aws_s3_bucket_public_access_block.website_public_access]
+}
+
+# Website Endpoint Output
+output "website_endpoint" {
+  value       = aws_s3_bucket_website_configuration.website_config.website_endpoint
+  description = "The static website endpoint URL"
+}
+
+# Define IAM Role for the Lambda Function
+resource "aws_iam_role" "polly_lambda_role" {
+  name = "PollyLambdaRole-${random_string.bucket_suffix.id}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+        Action    = "sts:AssumeRole"
+        Effect    = "Allow"
+        Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+  tags = { Project = "Polly-TTS-Website" }
+}
+
+# Attach the basic Lambda execution policy
+resource "aws_iam_policy_attachment" "lambda_basic_execution" {
+  name       = "LambdaBasicExecutionAttachment-${random_string.bucket_suffix.id}"
+  roles      = [aws_iam_role.polly_lambda_role.name]
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# Attach the Polly read-only policy
+resource "aws_iam_policy_attachment" "polly_read_only" {
+  name       = "PollyReadOnlyAttachment-${random_string.bucket_suffix.id}"
+  roles      = [aws_iam_role.polly_lambda_role.name]
+  policy_arn = "arn:aws:iam::aws:policy/AmazonPollyReadOnlyAccess"
+}
+
+# Define a custom policy to allow Get/Put to audio S3 bucket AND decrypt KMS keys
+resource "aws_iam_policy" "s3_put_audio_policy" {
+  name        = "S3PutAudioPolicy-${random_string.bucket_suffix.id}"
+  description = "Allow Lambda to put/get audio files and decrypt env vars" # Updated description
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      # S3 permissions (NOW INCLUDES GetObject)
+      {
+        Action   = ["s3:PutObject", "s3:GetObject"] # <-- CORRECTED ACTION LIST
+        Effect   = "Allow"
+        Resource = "${aws_s3_bucket.audio_bucket.arn}/*" # Grant access to all objects within the audio bucket
+      },
+      # KMS Decrypt permission (with SPECIFIC Key ARN)
+      {
+         Action   = "kms:Decrypt"
+         Effect   = "Allow"
+         Resource = "arn:aws:kms:us-east-1:605134445337:key/2efbb385-cab5-4795-91cf-84d3096a7f48" # <-- Specific Key ARN (NOT "*")
+      }
+    ]
+  })
+
+  tags = { Project = "Polly-TTS-Website" }
+}
+
+# Attach the custom S3/KMS policy to the role
+resource "aws_iam_policy_attachment" "s3_put_audio" {
+  name       = "S3PutAudioAttachment-${random_string.bucket_suffix.id}"
+  roles      = [aws_iam_role.polly_lambda_role.name]
+  policy_arn = aws_iam_policy.s3_put_audio_policy.arn # Reference the ARN of the custom policy above
+}
+
+# Package the Lambda code into a zip file
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/lambda_code"
+  output_path = "${path.module}/lambda_code.zip"
+}
+
+# Define the Lambda function resource
+resource "aws_lambda_function" "polly_tts_function" {
+  function_name = "PollyTTSFunction-${random_string.bucket_suffix.id}"
+  role          = aws_iam_role.polly_lambda_role.arn
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  handler          = "polly_lambda.lambda_handler"
+  runtime          = "python3.11"
+  timeout          = 30
+
+  environment {
+    variables = {
+      AUDIO_BUCKET_NAME = aws_s3_bucket.audio_bucket.id
+    }
+  }
+  tags = { Project = "Polly-TTS-Website" }
+}
+
+# Define the API Gateway HTTP API
+resource "aws_apigatewayv2_api" "http_api" {
+  name          = "PollyTTSApi-${random_string.bucket_suffix.id}"
+  protocol_type = "HTTP"
+  description   = "API Gateway for Polly TTS Lambda function"
+  cors_configuration {
+    allow_origins = ["*"]
+    allow_methods = ["POST", "OPTIONS"]
+    allow_headers = ["Content-Type"]
+    max_age       = 300
+  }
+  tags = { Project = "Polly-TTS-Website" }
+}
+
+# Define the Lambda integration for API Gateway
+resource "aws_apigatewayv2_integration" "lambda_integration" {
+  api_id           = aws_apigatewayv2_api.http_api.id
+  integration_type = "AWS_PROXY"
+  integration_uri  = aws_lambda_function.polly_tts_function.invoke_arn
+  payload_format_version = "2.0"
+}
+
+# Define the route for POST requests to /synthesize
+resource "aws_apigatewayv2_route" "api_route" {
+  api_id    = aws_apigatewayv2_api.http_api.id
+  route_key = "POST /synthesize"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
+}
+
+# Define the default stage which auto-deploys changes
+resource "aws_apigatewayv2_stage" "default_stage" {
+  api_id      = aws_apigatewayv2_api.http_api.id
+  name        = "$default"
+  auto_deploy = true
+}
+
+# Grant API Gateway permission to invoke the Lambda function
+resource "aws_lambda_permission" "api_gateway_invoke" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.polly_tts_function.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
+}
+
+# Output the final API endpoint URL
+output "api_endpoint" {
+  value       = aws_apigatewayv2_stage.default_stage.invoke_url
+  description = "The base URL for the API Gateway endpoint"
+}
+
+## JS Script
+// --- Configuration ---
+// IMPORTANT: Replace with the 'api_endpoint' output from Terraform, adding /synthesize
+const API_ENDPOINT = "https://l3pqy07dpa.execute-api.us-east-1.amazonaws.com/synthesize";
+// --- End Configuration ---
+
+// Get references to HTML elements
+const textInput = document.getElementById('textInput');
+const synthesizeButton = document.getElementById('synthesizeButton');
+const audioPlayback = document.getElementById('audioPlayback');
+const status = document.getElementById('status');
+
+// Add event listener to the button
+synthesizeButton.addEventListener('click', () => {
+    const text = textInput.value.trim();
+
+    if (!text) {
+        status.textContent = 'Please enter some text.';
+        return;
+    }
+
+    // Disable button and show status
+    synthesizeButton.disabled = true;
+    status.textContent = 'Synthesizing audio... please wait.';
+    audioPlayback.src = ''; // Clear previous audio
+
+    // Prepare data for API
+    const postData = {
+        text: text
+    };
+
+    // Call the API Gateway endpoint using fetch
+    fetch(API_ENDPOINT, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(postData), // Convert JS object to JSON string
+    })
+    .then(response => {
+        // Check if the response status is OK (e.g., 200)
+        if (!response.ok) {
+            // If not OK, try to parse error message from body, otherwise use status text
+            return response.json().catch(() => {
+                 throw new Error(`Request failed with status ${response.status}: ${response.statusText}`);
+             }).then(errorBody => {
+                 throw new Error(errorBody.error || `Request failed with status ${response.status}`);
+             });
+        }
+        // If OK, parse the successful JSON response body
+        return response.json();
+    })
+    .then(data => {
+        // On success, data should contain { audioUrl: "..." }
+        if (data.audioUrl) {
+            status.textContent = 'Audio ready. Playing...';
+            audioPlayback.src = data.audioUrl; // Set the audio source to the presigned URL
+            audioPlayback.play(); // Play the audio
+        } else {
+           throw new Error('API response did not contain audioUrl.');
+        }
+    })
+    .catch(error => {
+        // Handle errors during fetch or response processing
+        console.error('Error:', error);
+        status.textContent = `Error: ${error.message}`;
+    })
+    .finally(() => {
+        // Re-enable button regardless of success or error
+        synthesizeButton.disabled = false;
+        // Clear status after a delay if it wasn't an error message
+        if (!status.textContent.toLowerCase().startsWith('error')) {
+            setTimeout(() => { if (status.textContent === 'Audio ready. Playing...') status.textContent = ''; }, 5000);
+        }
+    });
+});
+
+##index file
+Text-to-Speech with AWS Polly
+Enter text below and click "Synthesize" to hear it spoken:
+
+Synthesize
+
+## Python Lambda file
+import json
+import boto3
+import os
+import uuid # To generate unique filenames
+
+# Initialize AWS clients (outside handler for potential reuse)
+polly_client = boto3.client('polly')
+s3_client = boto3.client('s3')
+
+# Get target S3 bucket name from environment variable
+TARGET_BUCKET = os.environ.get('AUDIO_BUCKET_NAME')
+# Get desired voice from environment variable, default to Joanna
+POLLY_VOICE = os.environ.get('POLLY_VOICE_ID', 'Joanna')
+
+print(f"Lambda initializing. Target Bucket: {TARGET_BUCKET}, Voice: {POLLY_VOICE}")
+
+def lambda_handler(event, context):
+    """
+    Handles API Gateway request, synthesizes speech using Polly,
+    saves MP3 to S3, generates presigned URL, and returns it.
+    """
+    print("Received event:", json.dumps(event))
+
+    if not TARGET_BUCKET:
+         print("Error: AUDIO_BUCKET_NAME environment variable not set.")
+         return {'statusCode': 500, 'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}, 'body': json.dumps({'error':'Internal configuration error: Target bucket not set.'})}
+
+    try:
+        # Extract text from the request body
+        if 'body' not in event or not event['body']:
+             raise ValueError("Request body is missing or empty.")
+
+        try:
+             request_body = json.loads(event['body'])
+        except json.JSONDecodeError:
+             raise ValueError("Invalid JSON format in request body.")
+
+        if 'text' not in request_body or not request_body['text']:
+             raise ValueError("Missing 'text' field in request body.")
+
+        text_to_synthesize = request_body['text']
+        print(f"Text to synthesize: '{text_to_synthesize}'")
+
+        # Call Polly to synthesize speech
+        print("Calling Polly SynthesizeSpeech...")
+        response = polly_client.synthesize_speech(
+            Text=text_to_synthesize,
+            OutputFormat='mp3',
+            VoiceId=POLLY_VOICE
+        )
+        print("Polly response received.")
+
+        # Polly returns the audio stream in the response body
+        audio_stream = response.get('AudioStream')
+
+        if audio_stream:
+            # Generate a unique filename for the MP3
+            output_filename = f"{uuid.uuid4()}.mp3"
+            print(f"Generated filename: {output_filename}")
+
+            # Upload the audio stream directly to S3
+            print(f"Uploading audio to S3 bucket {TARGET_BUCKET}...")
+            s3_client.put_object(
+                Bucket=TARGET_BUCKET,
+                Key=output_filename,
+                Body=audio_stream.read(), # Read the stream data
+                ContentType='audio/mpeg'
+            )
+            print("Successfully uploaded audio to S3.")
+
+            # Generate a pre-signed URL for temporary access to the S3 object
+            # This is more secure than making the bucket public
+            print("Generating pre-signed URL...")
+            presigned_url = s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': TARGET_BUCKET, 'Key': output_filename},
+                ExpiresIn=300  # URL expires in 300 seconds (5 minutes)
+            )
+            print(f"Generated pre-signed URL: {presigned_url}")
+
+            # Prepare the successful response body
+            response_body = {'audioUrl': presigned_url}
+
+            return {
+                'statusCode': 200,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                    },
+                'body': json.dumps(response_body)
+            }
+        else:
+            # Should not happen if Polly call was successful, but handle just in case
+            print("Error: No audio stream received from Polly.")
+            raise Exception("Polly did not return an audio stream.")
+
+    except ValueError as ve: # Handle specific input validation errors
+         print(f"Input validation error: {str(ve)}")
+         return {
+              'statusCode': 400, # Bad Request
+              'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+              'body': json.dumps({'error': str(ve)})
+              }
+    except Exception as e:
+         # Catch any other unexpected errors
+         print(f"Error during processing: {str(e)}")
+         # import traceback; traceback.print_exc() # Uncomment for detailed debugging
+         return {
+              'statusCode': 500, # Internal Server Error
+              'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+              'body': json.dumps({'error': f"An internal error occurred: {str(e)}"})
+              }
