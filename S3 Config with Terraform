@@ -1,0 +1,60 @@
+# Configure required providers
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0" # Use a recent AWS provider version
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.1" # Use a recent random provider version
+    }
+  }
+}
+
+# Configure the AWS Provider details
+provider "aws" {
+  region = "us-east-1" # Or your preferred AWS region
+}
+
+# Resource to generate a random suffix for the bucket name
+resource "random_string" "suffix" {
+  length  = 8
+  special = false
+  upper   = false
+  numeric = true # Added numeric for better randomness distribution
+}
+
+# Define the basic S3 bucket resource
+resource "aws_s3_bucket" "configured_bucket" {
+  # Use the random suffix to help ensure a unique bucket name
+  bucket = "terraform-config-bucket-${random_string.suffix.id}"
+
+  # Add some initial tags
+  tags = {
+    Project     = "Terraform S3 Config"
+    CreatedBy   = "Terraform"
+    Environment = "Learning"
+  }
+}
+
+# Output the final bucket name
+output "bucket_name" {
+  value       = aws_s3_bucket.configured_bucket.id
+  description = "The name of the configured S3 bucket"
+}
+
+# Output the bucket ARN
+output "bucket_arn" {
+  value       = aws_s3_bucket.configured_bucket.arn
+  description = "The ARN of the configured S3 bucket"
+}
+# Enable versioning on the bucket
+resource "aws_s3_bucket_versioning" "versioning" {
+  # Reference the ID of the bucket we defined earlier
+  bucket = aws_s3_bucket.configured_bucket.id
+
+  versioning_configuration {
+    status = "Enabled" # Turn versioning on
+  }
+}
