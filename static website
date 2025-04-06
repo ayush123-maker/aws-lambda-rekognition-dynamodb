@@ -1,0 +1,101 @@
+# Generate a random ID for uniqueness
+resource "random_id" "bucket_suffix" {
+  byte_length = 8
+}
+
+# Get the current region
+data "aws_region" "current" {}
+
+# Create an S3 bucket to store website content
+resource "aws_s3_bucket" "website_bucket" {
+  bucket = "my-static-website-${random_id.bucket_suffix.hex}" # Unique bucket name
+
+  # Enable static website hosting
+  website {
+    index_document = "index2.html"
+    error_document = "error.html"
+  }
+
+  # Configure public read access for website content
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid = "PublicReadGetObject"
+        Effect = "Allow"
+        Principal = "*"
+        Action = "s3:GetObject"
+        Resource = [
+          "arn:aws:s3:::my-static-website-${random_id.bucket_suffix.hex}",
+          "arn:aws:s3:::my-static-website-${random_id.bucket_suffix.hex}/*"
+        ]
+      },
+    ]
+  })
+}
+
+# Configure public access block for the S3 bucket
+resource "aws_s3_bucket_public_access_block" "website_bucket_public_access_block" {
+  bucket                  = aws_s3_bucket.website_bucket.id
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
+}
+
+# Create a CloudFront distribution to serve the S3 bucket content
+resource "aws_cloudfront_distribution" "s3_distribution" {
+  origin {
+    domain_name = aws_s3_bucket.website_bucket.bucket_regional_domain_name
+    origin_id   = "S3Origin"
+  }
+
+  enabled             = true
+  is_ipv6_enabled     = true
+  default_root_object = "index2.html"
+
+  default_cache_behavior {
+    allowed_methods  = ["GET", "HEAD"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = "S3Origin"
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    viewer_protocol_policy = "redirect-to-https"
+    min_ttl                = 0
+    default_ttl            = 3600
+    max_ttl                = 86400
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  depends_on = [aws_s3_bucket.website_bucket, aws_s3_bucket_public_access_block.website_bucket_public_access_block]
+}
+
+
+##providers file
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1" # You can choose a different AWS region if you prefer
+}
