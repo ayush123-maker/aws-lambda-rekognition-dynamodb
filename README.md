@@ -6,3 +6,5 @@ second project is a compehend tool
 third project was using Polly on Lambda with Terraform
 
 fourth proejct was a simple S3 bucket
+
+fifth project was launching elastic beanstalk with terraform
