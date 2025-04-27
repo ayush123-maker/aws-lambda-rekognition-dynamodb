@@ -1,0 +1,433 @@
+    # main.tf
+    # Defines the AWS resources to be created (Updated to create a new VPC, App Version, IAM Role/Profile)
+
+    terraform {
+      required_providers {
+        aws = {
+          source  = "hashicorp/aws"
+          version = "~> 5.0"
+        }
+        random = {
+          source  = "hashicorp/random"
+          version = "~> 3.0"
+        }
+        archive = {
+          source  = "hashicorp/archive"
+          version = "~> 2.2" # Use version compatible with your Terraform
+        }
+      }
+    }
+
+    # Configure the AWS Provider
+    provider "aws" {
+      region = var.aws_region
+    }
+
+    # Generate a random suffix for resource names
+    resource "random_string" "suffix" {
+      length  = 8
+      special = false
+      upper   = false
+    }
+
+    # --- Networking: Create a new VPC ---
+
+    # Get list of Availability Zones in the target region
+    data "aws_availability_zones" "available" {
+      state = "available"
+    }
+
+    # Create a new VPC
+    resource "aws_vpc" "lab_vpc" {
+      cidr_block           = "10.0.0.0/16" # Example CIDR block
+      enable_dns_support   = true
+      enable_dns_hostnames = true
+
+      tags = {
+        Name        = "${var.project_name}-vpc"
+        Environment = "Lab"
+        ManagedBy   = "Terraform"
+      }
+    }
+
+    # Create two public subnets in different Availability Zones
+    resource "aws_subnet" "public_subnet_a" {
+      vpc_id                  = aws_vpc.lab_vpc.id
+      cidr_block              = "10.0.1.0/24" # Subnet CIDR block 1
+      availability_zone       = data.aws_availability_zones.available.names[0] # First AZ
+      map_public_ip_on_launch = true # Instances launched here get public IPs
+
+      tags = {
+        Name        = "${var.project_name}-public-subnet-a"
+        Environment = "Lab"
+        ManagedBy   = "Terraform"
+      }
+    }
+
+    resource "aws_subnet" "public_subnet_b" {
+      vpc_id                  = aws_vpc.lab_vpc.id
+      cidr_block              = "10.0.2.0/24" # Subnet CIDR block 2
+      availability_zone       = data.aws_availability_zones.available.names[1] # Second AZ
+      map_public_ip_on_launch = true # Instances launched here get public IPs
+
+      tags = {
+        Name        = "${var.project_name}-public-subnet-b"
+        Environment = "Lab"
+        ManagedBy   = "Terraform"
+      }
+    }
+
+    # Create an Internet Gateway for the VPC
+    resource "aws_internet_gateway" "lab_igw" {
+      vpc_id = aws_vpc.lab_vpc.id
+
+      tags = {
+        Name        = "${var.project_name}-igw"
+        Environment = "Lab"
+        ManagedBy   = "Terraform"
+      }
+    }
+
+    # Create a Public Route Table
+    resource "aws_route_table" "public_route_table" {
+      vpc_id = aws_vpc.lab_vpc.id
+
+      # Default route out to the Internet Gateway
+      route {
+        cidr_block = "0.0.0.0/0"
+        gateway_id = aws_internet_gateway.lab_igw.id
+      }
+
+      tags = {
+        Name        = "${var.project_name}-public-rt"
+        Environment = "Lab"
+        ManagedBy   = "Terraform"
+      }
+    }
+
+    # Associate the Public Route Table with the public subnets
+    resource "aws_route_table_association" "public_assoc_a" {
+      subnet_id      = aws_subnet.public_subnet_a.id
+      route_table_id = aws_route_table.public_route_table.id
+    }
+
+    resource "aws_route_table_association" "public_assoc_b" {
+      subnet_id      = aws_subnet.public_subnet_b.id
+      route_table_id = aws_route_table.public_route_table.id
+    }
+
+    # --- S3 Bucket for Application Code ---
+
+    resource "aws_s3_bucket" "beanstalk_app_bucket" {
+      bucket = lower("${var.s3_bucket_prefix}${var.project_name}-${random_string.suffix.result}")
+
+      tags = {
+        Name        = "${var.project_name}-app-bucket"
+        Environment = "Lab"
+        ManagedBy   = "Terraform"
+      }
+    }
+
+    resource "aws_s3_bucket_public_access_block" "beanstalk_app_bucket_access_block" {
+      bucket = aws_s3_bucket.beanstalk_app_bucket.id
+
+      block_public_acls       = true
+      block_public_policy     = true
+      ignore_public_acls      = true
+      restrict_public_buckets = true
+    }
+
+     # --- Package and Upload Application Code ---
+
+    # Create a zip archive of the application source files
+    data "archive_file" "app_zip" {
+      type        = "zip"
+      source_dir  = var.app_source_dir # Directory containing application.py, requirements.txt
+      output_path = var.app_zip_output_path # Local path to create the zip file
+
+      # Exclude common unnecessary files/dirs if they exist
+      excludes = [
+         ".terraform",
+         ".git",
+         "*.tf",
+         "*.tfvars",
+         var.app_zip_output_path # Exclude the output zip itself if it exists
+      ]
+    }
+
+    # Upload the zipped application bundle to S3
+    resource "aws_s3_object" "app_bundle_upload" {
+      bucket = aws_s3_bucket.beanstalk_app_bucket.id
+      key    = "${var.project_name}-app-${data.archive_file.app_zip.output_md5}.zip" # Use MD5 hash in key for versioning
+      source = data.archive_file.app_zip.output_path
+      etag   = data.archive_file.app_zip.output_md5 # Use MD5 hash for etag
+
+      tags = {
+        Name        = "AppBundle"
+        ManagedBy   = "Terraform"
+      }
+      depends_on = [aws_s3_bucket_public_access_block.beanstalk_app_bucket_access_block, data.archive_file.app_zip]
+    }
+
+    # --- IAM Role and Instance Profile for Beanstalk EC2 Instances ---
+
+    # Define the assume role policy allowing EC2 instances to assume this role
+    data "aws_iam_policy_document" "beanstalk_ec2_assume_role_policy" {
+      statement {
+        actions = ["sts:AssumeRole"]
+        principals {
+          type        = "Service"
+          identifiers = ["ec2.amazonaws.com"]
+        }
+      }
+    }
+
+    # Create the IAM role for Beanstalk EC2 instances
+    resource "aws_iam_role" "beanstalk_ec2_role" {
+      name               = "${var.project_name}-ec2-role-${random_string.suffix.result}"
+      assume_role_policy = data.aws_iam_policy_document.beanstalk_ec2_assume_role_policy.json
+
+      tags = {
+        Name        = "${var.project_name}-ec2-role"
+        ManagedBy   = "Terraform"
+      }
+    }
+
+    # Attach necessary managed policies for web server environments
+    resource "aws_iam_role_policy_attachment" "beanstalk_webtier_policy" {
+      role       = aws_iam_role.beanstalk_ec2_role.name
+      policy_arn = "arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier"
+    }
+
+    # Create the IAM Instance Profile
+    resource "aws_iam_instance_profile" "beanstalk_ec2_instance_profile" {
+      name = "${var.project_name}-ec2-profile-${random_string.suffix.result}"
+      role = aws_iam_role.beanstalk_ec2_role.name # Associate the role created above
+
+      tags = {
+        Name        = "${var.project_name}-ec2-profile"
+        ManagedBy   = "Terraform"
+      }
+    }
+
+
+    # --- Elastic Beanstalk Application, Version, and Environment ---
+
+    # Create the Elastic Beanstalk Application
+    resource "aws_elastic_beanstalk_application" "flask_app" {
+      name        = "${var.project_name}-app-${random_string.suffix.result}"
+      description = "Flask application deployed via Terraform for ${var.project_name}"
+
+      tags = {
+        Name        = "${var.project_name}-application"
+        Environment = "Lab"
+        ManagedBy   = "Terraform"
+      }
+    }
+
+    # Explicitly create an Application Version
+    resource "aws_elastic_beanstalk_application_version" "flask_app_version" {
+      name        = "v-${data.archive_file.app_zip.output_md5}" # Use hash for version name
+      application = aws_elastic_beanstalk_application.flask_app.name
+      description = "Version ${data.archive_file.app_zip.output_md5} deployed via Terraform"
+      bucket      = aws_s3_bucket.beanstalk_app_bucket.id
+      key         = aws_s3_object.app_bundle_upload.key # Reference the S3 object key
+
+      # Ensure the application and S3 object exist first
+      depends_on = [
+        aws_elastic_beanstalk_application.flask_app,
+        aws_s3_object.app_bundle_upload
+      ]
+    }
+
+
+    # Create the Elastic Beanstalk Environment (this provisions the infrastructure)
+    resource "aws_elastic_beanstalk_environment" "flask_env" {
+      name                = "${var.project_name}-env-${random_string.suffix.result}"
+      application         = aws_elastic_beanstalk_application.flask_app.name
+      solution_stack_name = var.beanstalk_solution_stack_name
+      version_label       = aws_elastic_beanstalk_application_version.flask_app_version.name
+
+      # --- VPC Settings ---
+      # Explicitly configure VPC settings using the newly created VPC resources
+      setting {
+        namespace = "aws:ec2:vpc"
+        name      = "VPCId"
+        value     = aws_vpc.lab_vpc.id # Use the new VPC ID
+      }
+      setting {
+        namespace = "aws:ec2:vpc"
+        name      = "Subnets"
+        # Use comma-separated list of the new public subnet IDs
+        value     = join(",", [aws_subnet.public_subnet_a.id, aws_subnet.public_subnet_b.id])
+      }
+       setting {
+         namespace = "aws:ec2:vpc"
+         name      = "AssociatePublicIpAddress"
+         # Required for SingleInstance environments to be accessible
+         value     = "true"
+       }
+      # If using LoadBalanced environment type, you might also need:
+      # setting {
+      #   namespace = "aws:ec2:vpc"
+      #   name      = "ELBSubnets"
+      #   value     = join(",", [aws_subnet.public_subnet_a.id, aws_subnet.public_subnet_b.id])
+      # }
+      # --- End VPC Settings ---
+
+      setting {
+         namespace = "aws:autoscaling:launchconfiguration"
+         name      = "InstanceType"
+         value     = var.beanstalk_instance_type
+      }
+       setting {
+         namespace = "aws:autoscaling:launchconfiguration"
+         name      = "IamInstanceProfile"
+         value     = aws_iam_instance_profile.beanstalk_ec2_instance_profile.name
+      }
+       setting {
+         namespace = "aws:elasticbeanstalk:environment"
+         name      = "EnvironmentType"
+         value     = "SingleInstance" # Use SingleInstance for simplicity/cost in lab. Use LoadBalanced for production.
+      }
+       # Add other settings as needed (e.g., environment variables, scaling rules)
+
+      tags = {
+        Name        = "${var.project_name}-environment"
+        Environment = "Lab"
+        ManagedBy   = "Terraform"
+      }
+
+      # Depend on the application version and the instance profile being created
+      # Also depend on the Internet Gateway being attached to the VPC
+      depends_on = [
+        aws_elastic_beanstalk_application_version.flask_app_version,
+        aws_iam_instance_profile.beanstalk_ec2_instance_profile,
+        aws_internet_gateway.lab_igw # Added dependency
+      ]
+    }
+
+
+# outputs.tf
+# Defines values that will be displayed after Terraform applies the configuration
+
+output "s3_bucket_name" {
+  description = "The name of the S3 bucket holding the application bundle."
+  value       = aws_s3_bucket.beanstalk_app_bucket.bucket
+}
+
+output "beanstalk_application_name" {
+  description = "The name of the created Elastic Beanstalk application."
+  value       = aws_elastic_beanstalk_application.flask_app.name
+}
+
+output "beanstalk_environment_name" {
+  description = "The name of the created Elastic Beanstalk environment."
+  value       = aws_elastic_beanstalk_environment.flask_env.name
+}
+
+output "beanstalk_environment_cname" {
+  description = "The CNAME (URL) of the deployed Elastic Beanstalk environment."
+  value       = aws_elastic_beanstalk_environment.flask_env.cname
+}
+
+output "beanstalk_environment_endpoint_url" {
+  description = "The endpoint URL of the deployed Elastic Beanstalk environment."
+  value       = aws_elastic_beanstalk_environment.flask_env.endpoint_url
+}
+
+# variables.tf
+# Defines input variables for customization
+
+variable "aws_region" {
+  description = "The AWS region to deploy resources in."
+  type        = string
+  default     = "us-east-1" # Or your preferred region
+}
+
+variable "project_name" {
+  description = "A base name for resources to ensure uniqueness."
+  type        = string
+  default     = "eb-flask-lab"
+}
+
+variable "s3_bucket_prefix" {
+  description = "Prefix for the S3 bucket name. A random suffix will be added."
+  type        = string
+  default     = "tf-eb-" # Bucket names must be globally unique and lowercase
+}
+
+variable "app_source_dir" {
+  description = "Directory containing the application code (application.py, requirements.txt)."
+  type        = string
+  default     = "." # Current directory
+}
+
+variable "app_zip_output_path" {
+  description = "Path where the zipped application bundle will be created locally."
+  type        = string
+  default     = "eb-flask-app.zip"
+}
+
+variable "beanstalk_solution_stack_name" {
+  description = "The Elastic Beanstalk solution stack (platform) to use."
+  type        = string
+  # Find available names via AWS CLI: aws elasticbeanstalk list-available-solution-stacks
+  # Example uses Python 3.9 on Amazon Linux 2
+  default     = "64bit Amazon Linux 2 v3.6.2 running Python 3.9"
+}
+
+variable "beanstalk_instance_type" {
+  description = "The EC2 instance type for the Beanstalk environment."
+  type        = string
+  default     = "t3.micro" # Often Free Tier eligible
+}
+
+# application.py
+# A very simple Flask web application for Elastic Beanstalk deployment.
+
+from flask import Flask
+
+# Print Flask version for debugging in logs (optional)
+# import flask
+# print(flask.__version__)
+
+# EB looks for an 'application' callable by default.
+application = Flask(__name__)
+
+# Define a route for the default URL ('/')
+@application.route('/')
+def hello_world():
+    """Returns a simple HTML greeting."""
+    # You can customize the HTML message here
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Elastic Beanstalk App</title>
+        <style>
+            body { font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background-color: #f0f0f0; }
+            .container { text-align: center; padding: 30px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { color: #333; }
+            p { color: #555; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Hello World!</h1>
+            <p>This application was deployed using AWS Elastic Beanstalk and Terraform.</p>
+        </div>
+    </body>
+    </html>
+    """
+    return html_content
+
+# Run the application locally if this script is executed directly
+# (This part is not used by Elastic Beanstalk but is useful for local testing)
+if __name__ == '__main__':
+    # Setting debug=True enables auto-reloading and detailed error pages
+    # Host='0.0.0.0' makes the server accessible externally (e.g., within a container or VM)
+    # Port 5000 is the default Flask development server port
+    application.run(host='0.0.0.0', port=5000, debug=True)
